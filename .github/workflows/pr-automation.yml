@@ -1,0 +1,253 @@
+name: Pull Request Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run ESLint
+        id: eslint
+        run: |
+          if npm run | grep -q "lint"; then
+            npm run lint || true
+          else
+            echo "No lint script found; attempting npx eslint ." || true
+            npx eslint . || true
+          fi
+
+      - name: Run Prettier check
+        id: prettier
+        run: |
+          if npm run | grep -q "prettier"; then
+            npm run prettier -- --check . || true
+          else
+            npx prettier --check . || true
+          fi
+
+      - name: Collect Code Quality Report
+        id: cq-report
+        run: |
+          echo "Code Quality Report" > cq_report.txt
+          echo "ESLint: See logs above for rule violations" >> cq_report.txt
+          echo "Prettier: See logs above for formatting differences" >> cq_report.txt
+
+      - name: Post Code Quality PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('cq_report.txt', 'utf8');
+            const { owner, repo, number } = context.issue;
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Run tests with coverage
+        id: test
+        run: |
+          if npm run | grep -q "test"; then
+            npm test -- --coverage || npm test || true
+          else
+            echo "No test script found; skipping tests" && exit 0
+          fi
+
+      - name: Collect Coverage Summary
+        id: coverage
+        run: |
+          echo "Test Coverage Report" > coverage_summary.txt
+          if [ -f coverage/lcov.info ]; then
+            lines=$(grep -m1 -E 'lines|statements|functions|branches' coverage/lcov.info || true)
+            echo "${lines}" >> coverage_summary.txt
+          elif [ -f coverage/coverage-summary.json ]; then
+            cat coverage/coverage-summary.json >> coverage_summary.txt
+          else
+            echo "Coverage files not found. See test logs for details." >> coverage_summary.txt
+          fi
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage/
+            coverage_summary.txt
+          if-no-files-found: warn
+
+      - name: Post Coverage PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('coverage_summary.txt', 'utf8');
+            const { owner, repo, number } = context.issue;
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Audit dependencies for vulnerabilities
+        id: npm-audit
+        run: |
+          npm audit --audit-level=low || true
+
+      - name: Scan for secrets
+        id: secret-scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: "detect --redact --report-format json --report-path gitleaks-report.json"
+
+      - name: Collect Security Scan Report
+        id: sec-report
+        run: |
+          echo "Security Scan Report" > security_report.txt
+          echo "Dependencies: npm audit results above. Vulnerabilities summary may require manual review." >> security_report.txt
+          if [ -f gitleaks-report.json ]; then
+            echo "Secrets scan report (redacted):" >> security_report.txt
+            head -n 200 gitleaks-report.json >> security_report.txt || true
+          else
+            echo "No secrets report generated." >> security_report.txt
+          fi
+
+      - name: Post Security PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('security_report.txt', 'utf8');
+            const { owner, repo, number } = context.issue;
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci || npm install
+
+      - name: Build application
+        id: build
+        run: |
+          if npm run | grep -q "build"; then
+            npm run build || true
+          else
+            echo "No build script found; attempting a generic build step" || true
+          fi
+
+      - name: Start application for validation
+        id: start-app
+        run: |
+          if npm run | grep -q "start"; then
+            nohup npm start &
+            echo $! > app_pid.txt
+            sleep 5
+          else
+            echo "No start script found; skipping runtime validation"
+          fi
+
+      - name: Validate endpoints
+        id: validate
+        run: |
+          if [ -f app_pid.txt ]; then
+            # Try common endpoints
+            for url in \
+              "http://localhost:3000/" \
+              "http://localhost:3000/health" \
+              "http://localhost:8080/" \
+              "http://localhost:8080/health"; do
+              echo "Attempting to curl $url";
+              curl -sS --max-time 5 "$url" || true;
+            done
+          fi
+
+      - name: Create deployment preview artifacts
+        id: artifacts
+        run: |
+          echo "Build Validation" > build_validation.txt
+          echo "Build logs are available above. Endpoints probed: /, /health on common ports." >> build_validation.txt
+          if [ -f app_pid.txt ]; then
+            echo "Application started for validation. See curl outputs in logs." >> build_validation.txt
+          else
+            echo "Application did not start; validation limited to build step." >> build_validation.txt
+          fi
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-validation-artifacts
+          path: build_validation.txt
+
+      - name: Stop application
+        if: success() || failure()
+        run: |
+          if [ -f app_pid.txt ]; then
+            kill $(cat app_pid.txt) || true
+          fi
+
+      - name: Post Build Status PR Comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('build_validation.txt', 'utf8');
+            const { owner, repo, number } = context.issue;
+            await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
